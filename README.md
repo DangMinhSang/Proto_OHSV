@@ -1,6 +1,5 @@
 # A Prototypical Signature Approach for Writer-Independent Offline Signature Verification
 https://github.com/kdMoura/proto_hsv
-This repository contains the official implementation of the experiments presented in our paper.
 
 It provides tools for:
 
