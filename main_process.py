@@ -17,7 +17,8 @@ from sklearn.linear_model import SGDClassifier
 from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
-from sklearn.pipeline import Pipeline
+from sklearn.cluster import KMeans
+
 from shsv.data import (load_extracted_features,
                        _compute_dissimilarity,
                        generate_diss_test_data)
@@ -26,123 +27,168 @@ from prototype_model import PrototypeModel, PROTOTYPE_MODELS
 from util import find_closest_samples, run_script, get_subset
 
 
-
 def generate_diss_training_data(
-            data: np.ndarray,
-            label: np.ndarray,
-            prototypes: Optional[np.ndarray],
-            rng: np.random.RandomState,
-            dist_type: str = "standard",
-            n_gen: int = 12,
-        ) -> Tuple[np.ndarray, np.ndarray]:
+        data: np.ndarray,
+        label: np.ndarray,
+        prototypes: Optional[np.ndarray],
+        rng: np.random.RandomState,
+        dist_type: str = "standard",
+        n_gen: int = 12,
+        n_writer_centroids: int = 2
+    ) -> Tuple[np.ndarray, np.ndarray]:
 
     """
-    Generate dissimilarity-based training data for writer-independent learning.
+    Generate dissimilarity data for writer-independent learning.
 
-    This function creates positive and negative dissimilarity vectors for each user.
-    Positive pairs correspond to pairs of genuine signatures from the same user.
-    Negative pairs are generated using either:
-        - signatures from different users ("standard"), or
-        - prototypes closest to the user's positive centroid ("poscentroid").
-
-    Parameters
-    ----------
-    data : np.ndarray of shape (N, F)
-        Feature vectors of all signatures.
-    label : np.ndarray of shape (N,)
-        User IDs associated with each feature vector.
-    prototypes : np.ndarray of shape (K, F) or None
-        Prototype vectors used when `dist_type='poscentroid'`.
-        Ignored when `dist_type='standard'`.
-    rng : numpy.random.RandomState
-        Random generator used for reproducibility.
-    dist_type : {"standard", "poscentroid"}, default="standard"
-        Defines the strategy for sampling negative dissimilarities.
-    n_gen : int, default=12
-        Number of genuine signatures sampled per user for creating dissimilarity pairs.
-
-    Returns
-    -------
-    diss_x : np.ndarray of shape (M, F)
-        The generated dissimilarity vectors (positive and negative).
-    diss_y : np.ndarray of shape (M,)
-        Dissimilarity labels: 1 for positive pairs, 0 for negative pairs.
+    dist_type:
+        - standard: random signatures from other writers
+        - poscentroid: prototypes closest to one writer centroid
+        - multicentroid: prototypes closest to multiple writer centroids
     """
-    
-    feat_size = data.shape[1] # Get number of features
-   
+
+    feat_size = data.shape[1]
     diss_data = []
     diss_target = []
-    diss_ref_users = []
 
-    print('Computing diss. for each user')
-    for user_id in np.unique(label):#range(300, max_id_user):
-        
-        user_indices = np.where((label == user_id))[0] #Get users signatures idxs
+    if dist_type not in ["standard", "poscentroid", "multicentroid"]:
+        raise ValueError(f"Invalid dist_type: {dist_type}")
+
+    if dist_type in ["poscentroid", "multicentroid"] and prototypes is None:
+        raise ValueError(f"prototypes cannot be None when dist_type={dist_type}")
+
+    print(f"Computing dissimilarities using {dist_type}")
+
+    for user_id in np.unique(label):
+        user_indices = np.where(label == user_id)[0]
+
+        if len(user_indices) < n_gen:
+            raise ValueError(
+                f"Writer {user_id} has {len(user_indices)} genuine signatures, "
+                f"but n_gen={n_gen}"
+            )
+
         gen_idxs = rng.choice(user_indices, size=n_gen, replace=False)
         f_gen = data[gen_idxs]
-        
-        # Positive
+
+        # Positive dissimilarities
         pos_diss = np.abs(f_gen[:, None] - f_gen)
-        # get indices of the upper triangle
-        sig_idxs = np.triu_indices(n_gen, k=1) 
-        ddp = pos_diss[sig_idxs] #.reshape(-1,feat_size)
-        
-        # Number of gen X prot to keep a balanced data
-        n_pos_s = n_gen-1 if n_gen%2 == 0 else n_gen #Number of select gen
-        
-        
-        # Negative
-        if dist_type == 'standard':
-            n_neg_s = (n_gen//2) # Number of select prot
-            
-            diff_user_indices = np.where((label != user_id))[0]     
-            
-            rf_idxs = rng.choice(diff_user_indices, size=n_neg_s, replace=False)    
-            
+        sig_idxs = np.triu_indices(n_gen, k=1)
+        ddp = pos_diss[sig_idxs]
+
+        # Same configuration as the original repository
+        n_pos_s = n_gen - 1 if n_gen % 2 == 0 else n_gen
+        n_neg_s = n_gen // 2
+
+        if dist_type == "standard":
+            diff_user_indices = np.where(label != user_id)[0]
+
+            if len(diff_user_indices) < n_neg_s:
+                raise ValueError("Not enough signatures from other writers")
+
+            rf_idxs = rng.choice(diff_user_indices, size=n_neg_s, replace=False)
             f_rf = data[rf_idxs]
-            
-            neg_diss, _, _ = _compute_dissimilarity(f_gen[:n_pos_s], 
-                                             f_rf, 
-                                             gen_idxs[:n_pos_s], 
-                                             rf_idxs)
-        
-        elif dist_type == 'poscentroid':
-            
-            # Compute the mean value among genuine sig. features and use it to get the closest prototypes
-            if prototypes.shape[0] >= (n_gen//2):
-                n_neg_s = (n_gen//2) # Number of select prot
-            
-            else:
-                print(
-                    f"Number of required prot. selection for balanced data {n_gen // 2} "
-                    f"is smaller than number of available prot. ({prototypes.shape[0]})."
-                )
-                n_neg_s = prototypes.shape[0] 
-                
+
+            neg_diss, _, _ = _compute_dissimilarity(
+                f_gen[:n_pos_s],
+                f_rf,
+                gen_idxs[:n_pos_s],
+                rf_idxs
+            )
+
+        elif dist_type == "poscentroid":
+            n_neg_s = min(n_neg_s, prototypes.shape[0])
+
             pos_centroid = np.mean(f_gen, axis=0)
             sorted_prot, _, _ = find_closest_samples(prototypes, pos_centroid)
-            
-            neg_diss, _, _ = _compute_dissimilarity(f_gen[:n_pos_s], 
-                                             sorted_prot[0:n_neg_s], 
-                                             gen_idxs[:n_pos_s], 
-                                             np.arange(n_neg_s))
-        
-        else:
-            raise Exception("dist_type does not exist!")
-           
-        
-        ddn = neg_diss.reshape(-1,feat_size)
-        diss_data.append(np.concatenate([ddp, ddn],axis=0))
-        
-        diss_target.extend(len(sig_idxs[0])*[1])    
-        diss_target.extend(ddn.shape[0]*[0])
-        
-        diss_ref_users.extend( (len(sig_idxs[0]) + ddn.shape[0])  
-                              * [user_id])
-        
-   
-    return np.array(diss_data).reshape(-1,feat_size), np.array(diss_target)
+            selected_prototypes = sorted_prot[:n_neg_s]
+
+            neg_diss, _, _ = _compute_dissimilarity(
+                f_gen[:n_pos_s],
+                selected_prototypes,
+                gen_idxs[:n_pos_s],
+                np.arange(len(selected_prototypes))
+            )
+
+        elif dist_type == "multicentroid":
+            n_neg_s = min(n_neg_s, prototypes.shape[0])
+            actual_n_centroids = min(n_writer_centroids, n_gen)
+
+            if actual_n_centroids == 1:
+                writer_centroids = np.mean(f_gen, axis=0, keepdims=True)
+            else:
+                writer_kmeans = KMeans(
+                    n_clusters=actual_n_centroids,
+                    random_state=int(rng.randint(0, 2**31 - 1)),
+                    n_init=10
+                )
+                writer_kmeans.fit(f_gen)
+                writer_centroids = writer_kmeans.cluster_centers_
+
+            # Rank global prototypes by distance to each writer centroid
+            prototype_rankings = []
+
+            for centroid in writer_centroids:
+                _, sorted_indices, _ = find_closest_samples(prototypes, centroid)
+                prototype_rankings.append(sorted_indices)
+
+            # Select prototypes in round-robin order to represent every writer mode
+            selected_indices = []
+            selected_set = set()
+            positions = [0] * actual_n_centroids
+
+            while len(selected_indices) < n_neg_s:
+                added = False
+
+                for centroid_idx in range(actual_n_centroids):
+                    ranking = prototype_rankings[centroid_idx]
+
+                    while positions[centroid_idx] < len(ranking):
+                        prototype_idx = int(ranking[positions[centroid_idx]])
+                        positions[centroid_idx] += 1
+
+                        if prototype_idx not in selected_set:
+                            selected_indices.append(prototype_idx)
+                            selected_set.add(prototype_idx)
+                            added = True
+                            break
+
+                    if len(selected_indices) == n_neg_s:
+                        break
+
+                if not added:
+                    break
+
+            if len(selected_indices) == 0:
+                raise RuntimeError(f"Could not select prototypes for writer {user_id}")
+
+            selected_prototypes = prototypes[selected_indices]
+
+            neg_diss, _, _ = _compute_dissimilarity(
+                f_gen[:n_pos_s],
+                selected_prototypes,
+                gen_idxs[:n_pos_s],
+                np.arange(len(selected_prototypes))
+            )
+
+            print(
+                f"Writer {user_id}: {actual_n_centroids} centroids, "
+                f"{len(selected_prototypes)} selected prototypes"
+            )
+
+        ddn = neg_diss.reshape(-1, feat_size)
+        diss_data.append(np.concatenate([ddp, ddn], axis=0))
+
+        diss_target.extend([1] * ddp.shape[0])
+        diss_target.extend([0] * ddn.shape[0])
+
+    diss_x = np.concatenate(diss_data, axis=0)
+    diss_y = np.asarray(diss_target, dtype=np.int64)
+
+    print(f"Dissimilarity shape: {diss_x.shape}")
+    print(f"Positive pairs: {np.sum(diss_y == 1)}")
+    print(f"Negative pairs: {np.sum(diss_y == 0)}")
+
+    return diss_x, diss_y
 
 def train(model_choice: Literal["svm", "sgd"],
             tr_x: np.ndarray,
@@ -150,39 +196,63 @@ def train(model_choice: Literal["svm", "sgd"],
             seed: int = 42,
             perform_training: bool = True,
             svm_cache_size_mb: int = 16384,
-        ) -> Union[Pipeline, SVC, SGDClassifier]:
+        ) -> Union[SVC, SGDClassifier]:
+    
+    """
+    Train a writer-independent classifier on dissimilarity data.
+
+    Parameters
+    ----------
+    model_choice : {"svm", "sgd"}
+        Classification model to train.
+    tr_x : np.ndarray of shape (N, F)
+        Training dissimilarity vectors.
+    tr_y : np.ndarray of shape (N,)
+        Binary labels (1 = positive pair, 0 = negative pair).
+    seed : int, default=42
+        Random seed for model initialization.
+    perform_training : bool, default=True
+        If False, return an untrained model.
+    svm_cache_size_mb : int, default=16384
+        Cache size for the SVM model.
+
+    Returns
+    -------
+    model : sklearn.svm.SVC or sklearn.linear_model.SGDClassifier
+        The fitted model (or unfitted model if perform_training=False).
+    """
     
     print("--- BATCH TRAINING ---")
+
     
     n_neg, n_pos = np.unique(tr_y, return_counts=True)[1]
+    
     skew = n_neg / float(n_pos)
     
     if 'sgd' in model_choice:
-        clf = SGDClassifier(loss='hinge', 
-                            random_state=seed,
-                            alpha=0.1,
-                            eta0=0.01,
-                            max_iter=2000,
-                            tol=0.001)
-        # Bọc SGD trong Pipeline cùng với StandardScaler
-        model = Pipeline([
-            ('scaler', StandardScaler()),
-            ('classifier', clf)
-        ])
+        
+         model = SGDClassifier(loss='hinge', 
+                               random_state=seed,
+                               alpha=0.1,
+                               #eta0=1,
+                               eta0=0.01,
+                               max_iter=2000,
+                               tol=0.001)
            
     else: # model_choice == 'svm':
-        clf = SVC(C=1, gamma=2**-11, 
-                  class_weight={1: skew},
-                  cache_size=svm_cache_size_mb)
-        # Bọc SVC trong Pipeline cùng với StandardScaler
-        model = Pipeline([
-            ('scaler', StandardScaler()),
-            ('classifier', clf)
-        ])
+        model = SVC(C=1, gamma=2**-11, 
+                    class_weight={1: skew},
+                    cache_size=svm_cache_size_mb) 
+   
+    
         
     if perform_training:
-        model.fit(tr_x, tr_y)
-        return model
+        final_model = model
+
+        final_model.fit(tr_x, tr_y)
+        
+        
+        return final_model
 
     return model
         
@@ -540,11 +610,12 @@ def parse_args(args_list=None):
     main_parser.add_argument('--cluster-algo', type=str, default='kmeans', choices=PROTOTYPE_MODELS)
     main_parser.add_argument('--n-clusters', type=int, default=10)
     main_parser.add_argument('--model-choice', type=str, default='sgd', choices=['svm','sgd'])
-    main_parser.add_argument('--dist-type', type=str, default='poscentroid', choices=['standard', 'poscentroid'])
+    main_parser.add_argument('--dist-type', type=str, default='poscentroid', choices=['standard', 'poscentroid', 'multicentroid'])
 
     main_parser.add_argument('--f-pred-path', type=str, required=True,  help='Absolute path to a folder where predictions will be saved.')
     main_parser.add_argument('--f-metric-path', type=str, required=True,  help='Absolute path to a folder where computed metrics will be saved.')
     main_parser.add_argument('--input-feat-path', type=str, required=True, help='Path to a npz file containing the fields: features, y (labels), and yforg (forgery flag).')
+    main_parser.add_argument("--n-writer-centroids",type=int,default=2)
 
     main_parser.add_argument('--exp-users', type=int, nargs=2, default=(0, 300))
     main_parser.add_argument('--dev-users', type=int, nargs=2, default=(300, 581))
