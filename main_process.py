@@ -92,6 +92,11 @@ def select_boundary_prototypes(
 
     # Last fallback: use all prototypes ordered by boundary distance
     if len(candidate_indices) < n_select:
+        print(
+            f"Warning: only {len(candidate_indices)} safe prototypes "
+            f"available, but {n_select} are required."
+        )
+
         candidate_indices = np.argsort(
             np.abs(normalized_distances - boundary_low)
         )
@@ -613,19 +618,19 @@ def main_validation(args):
         prototypes = scaler.inverse_transform(scaled_prototypes)
         
         # Create diss. training data
-        diss_data, diss_target = diss_data, diss_target = generate_diss_training_data(
-                    data,
-                    label,
-                    prototypes,
-                    rng,
-                    dist_type=dist_type,
-                    n_gen=num_gen_train,
-                    n_writer_centroids=args.n_writer_centroids,
-                    boundary_low=args.boundary_low,
-                    boundary_high=args.boundary_high,
-                    radius_neighbors=args.radius_neighbors,
-                    diversity_weight=args.diversity_weight
-                )
+        diss_data, diss_target = generate_diss_training_data(
+            X_train,
+            y_train,
+            prototypes,
+            rng,
+            dist_type=dist_type,
+            n_gen=num_gen_train,
+            n_writer_centroids=args.n_writer_centroids,
+            boundary_low=args.boundary_low,
+            boundary_high=args.boundary_high,
+            radius_neighbors=args.radius_neighbors,
+            diversity_weight=args.diversity_weight
+        )
 
         # Create feat. validation data
         input_data = (
@@ -649,7 +654,7 @@ def main_validation(args):
         model = train(model_choice, diss_data,  diss_target)
         
         # Output pred filename
-        filename= f'{basename}_ts__n{fold}_r{num_gen_ref}_q{num_gen_test}_sk0__iuVal.csv'
+        filename= f'{basename}_ts__n{fold}_r{num_gen_ref}_q{num_gen_test}_sk1__iuVal.csv'
         
         # Validate classifier
         test(model, diss_val_x, diss_val_y, diss_val_ds, output_path,filename=filename)
@@ -699,8 +704,22 @@ def main_test(args):
     prot_model = PrototypeModel(name=cluster_algo, n_clusters=k )
     prototypes = None
         
-    # Output pred folder
-    pred_folder = f'{basename}_{model_choice}_{cluster_algo}_{dist_type}_g{num_gen_train}_k{k}_r{num_gen_ref}_q{num_gen_test}'
+    method_suffix = ''
+    if dist_type == "boundary":
+        method_suffix = (
+            f"_bl{args.boundary_low}"
+            f"_bh{args.boundary_high}"
+            f"_rn{args.radius_neighbors}"
+            f"_dw{args.diversity_weight}"
+        )
+    elif dist_type == "multicentroid":
+        method_suffix = f"_wc{args.n_writer_centroids}"
+    
+    pred_folder = (
+        f"{basename}_{model_choice}_{cluster_algo}_{dist_type}"
+        f"_g{num_gen_train}_k{k}_r{num_gen_ref}_q{num_gen_test}"
+        f"{method_suffix}"
+    )
     output_path = os.path.join(f_pred_path, pred_folder)
     
 
@@ -718,6 +737,7 @@ def main_test(args):
 
             scaled_prototypes = prot_model.get_prototypes()
             prototypes = scaler.inverse_transform(scaled_prototypes)
+            
 
     # Seed            
     rng = np.random.RandomState(args.seed)
