@@ -175,12 +175,10 @@ def generate_diss_training_data(
     diss_data = []
     diss_target = []
 
-    valid_dist_types = ["standard", "poscentroid", "multicentroid", "boundary"]
-
-    if dist_type not in valid_dist_types:
+    if dist_type not in ["standard", "poscentroid", "multicentroid"]:
         raise ValueError(f"Invalid dist_type: {dist_type}")
 
-    if dist_type != "standard" and prototypes is None:
+    if dist_type in ["poscentroid", "multicentroid"] and prototypes is None:
         raise ValueError(f"prototypes cannot be None when dist_type={dist_type}")
 
     print(f"Computing dissimilarities using {dist_type}")
@@ -743,18 +741,14 @@ def main_test(args):
         model = train(model_choice, diss_data,  diss_target)
         
         # Create diss. test data
-        diss_test_x, diss_test_y, *diss_test_ds  = next(generate_diss_training_data(
-                    data,
-                    label,
-                    prototypes,
+        diss_test_x, diss_test_y, *diss_test_ds  = next(generate_diss_test_data(
+                    exp_set, 
                     rng,
-                    dist_type=dist_type,
-                    n_gen=num_gen_train,
-                    n_writer_centroids=args.n_writer_centroids,
-                    boundary_low=args.boundary_low,
-                    boundary_high=args.boundary_high,
-                    radius_neighbors=args.radius_neighbors,
-                    diversity_weight=args.diversity_weight
+                    n_data = 1,
+                    n_ref= num_gen_ref,
+                    n_query= num_gen_test,
+                    include_skilled_forgery=True,
+                    return_indices=True
                 ))
         
         test_filename = f'{basename}_ts__n{file_number}_r{num_gen_ref}_q{num_gen_test}_sk1_iu{exp_users[0]}-{exp_users[-1]+1}.npz'
