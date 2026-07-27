@@ -175,10 +175,12 @@ def generate_diss_training_data(
     diss_data = []
     diss_target = []
 
-    if dist_type not in ["standard", "poscentroid", "multicentroid"]:
+    valid_dist_types = ["standard", "poscentroid", "multicentroid", "boundary"]
+
+    if dist_type not in valid_dist_types:
         raise ValueError(f"Invalid dist_type: {dist_type}")
 
-    if dist_type in ["poscentroid", "multicentroid"] and prototypes is None:
+    if dist_type != "standard" and prototypes is None:
         raise ValueError(f"prototypes cannot be None when dist_type={dist_type}")
 
     print(f"Computing dissimilarities using {dist_type}")
@@ -741,7 +743,7 @@ def main_test(args):
         model = train(model_choice, diss_data,  diss_target)
         
         # Create diss. test data
-        diss_test_x, diss_test_y, *diss_test_ds  = next(diss_data, diss_target = generate_diss_training_data(
+        diss_test_x, diss_test_y, *diss_test_ds  = next(generate_diss_training_data(
                     data,
                     label,
                     prototypes,
