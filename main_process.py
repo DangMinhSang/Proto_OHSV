@@ -190,7 +190,7 @@ def generate_diss_training_data(
         n_gen: int = 12,
         n_writer_centroids: int = 2,
         boundary_low: float = 1.0,
-        boundary_high: float = 2.5,
+        pool_factor: int = 2,
         radius_neighbors: int = 2,
         diversity_weight: float = 0.25
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -342,7 +342,7 @@ def generate_diss_training_data(
                 prototypes=prototypes,
                 n_select=n_neg_s,
                 boundary_low=boundary_low,
-                boundary_high=boundary_high,
+                pool_factor=pool_factor,
                 radius_neighbors=radius_neighbors,
                 diversity_weight=diversity_weight
             )
@@ -355,9 +355,12 @@ def generate_diss_training_data(
             )
 
             print(
-                f"Writer {user_id}: boundary candidates="
-                f"{diagnostics['n_boundary_candidates']}, selected={selected_indices.tolist()}, "
-                f"distances={np.round(diagnostics['selected_normalized_distances'], 3).tolist()}"
+                f"Writer {user_id}: "
+                f"safe={diagnostics['n_safe_prototypes']}, "
+                f"pool={diagnostics['pool_size']}, "
+                f"selected={selected_indices.tolist()}, "
+                f"distances="
+                f"{np.round(diagnostics['selected_normalized_distances'], 3).tolist()}"
             )
 
         ddn = neg_diss.reshape(-1, feat_size)
@@ -607,7 +610,23 @@ def main_validation(args):
     basename = os.path.basename(input_features_path).replace(".npz","")
     
     # Output pred folder
-    pred_folder = f'{basename}_{model_choice}_{cluster_algo}_{dist_type}_g{num_gen_train}_k{k}_r{num_gen_ref}_q{num_gen_test}_val'
+    method_suffix = ""
+
+    if dist_type == "boundary":
+        method_suffix = (
+            f"_bl{args.boundary_low}"
+            f"_pf{args.pool_factor}"
+            f"_rn{args.radius_neighbors}"
+            f"_dw{args.diversity_weight}"
+        )
+    elif dist_type == "multicentroid":
+        method_suffix = f"_wc{args.n_writer_centroids}"
+
+    pred_folder = (
+        f"{basename}_{model_choice}_{cluster_algo}_{dist_type}"
+        f"_g{num_gen_train}_k{k}_r{num_gen_ref}_q{num_gen_test}"
+        f"{method_suffix}_val"
+    )
     output_path = os.path.join(f_pred_path, pred_folder)
     
     # Preparing data
@@ -646,7 +665,7 @@ def main_validation(args):
         prototypes = scaler.inverse_transform(scaled_prototypes)
         
         # Create diss. training data
-        diss_data, diss_target = generate_diss_training_data(
+        diss_data, diss_target = diss_data, diss_target = diss_data, diss_target = generate_diss_training_data(
             X_train,
             y_train,
             prototypes,
@@ -655,7 +674,7 @@ def main_validation(args):
             n_gen=num_gen_train,
             n_writer_centroids=args.n_writer_centroids,
             boundary_low=args.boundary_low,
-            boundary_high=args.boundary_high,
+            pool_factor=args.pool_factor,
             radius_neighbors=args.radius_neighbors,
             diversity_weight=args.diversity_weight
         )
@@ -732,11 +751,12 @@ def main_test(args):
     prot_model = PrototypeModel(name=cluster_algo, n_clusters=k )
     prototypes = None
         
-    method_suffix = ''
+    method_suffix = ""
+
     if dist_type == "boundary":
         method_suffix = (
             f"_bl{args.boundary_low}"
-            f"_bh{args.boundary_high}"
+            f"_pf{args.pool_factor}"
             f"_rn{args.radius_neighbors}"
             f"_dw{args.diversity_weight}"
         )
@@ -773,7 +793,7 @@ def main_test(args):
         print(file_number)
         
         # Create diss. training data
-        diss_data, diss_target = generate_diss_training_data(
+        diss_data, diss_target = diss_data, diss_target = generate_diss_training_data(
                     data,
                     label,
                     prototypes,
@@ -782,7 +802,7 @@ def main_test(args):
                     n_gen=num_gen_train,
                     n_writer_centroids=args.n_writer_centroids,
                     boundary_low=args.boundary_low,
-                    boundary_high=args.boundary_high,
+                    pool_factor=args.pool_factor,
                     radius_neighbors=args.radius_neighbors,
                     diversity_weight=args.diversity_weight
                 )
@@ -849,9 +869,9 @@ def parse_args(args_list=None):
 
     #Boundary
     main_parser.add_argument("--boundary-low", type=float, default=1.0)
-    main_parser.add_argument("--boundary-high", type=float, default=2.5)
+    main_parser.add_argument("--pool-factor", type=int, default=2)
     main_parser.add_argument("--radius-neighbors", type=int, default=2)
-    main_parser.add_argument("--diversity-weight", type=float, default=0.25)
+    main_parser.add_argument("--diversity-weight", type=float, default=0.0)
     
     
     main_parser.set_defaults(func=main)
