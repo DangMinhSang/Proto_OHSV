@@ -18,7 +18,7 @@ from sklearn.model_selection import KFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 from sklearn.cluster import KMeans
-
+from scipy.spatial.distance import cdist
 from shsv.data import (load_extracted_features,
                        _compute_dissimilarity,
                        generate_diss_test_data)
@@ -26,6 +26,127 @@ from shsv.data import (load_extracted_features,
 from prototype_model import PrototypeModel, PROTOTYPE_MODELS
 from util import find_closest_samples, run_script, get_subset
 
+def select_boundary_prototypes(
+        f_gen: np.ndarray,
+        prototypes: np.ndarray,
+        n_select: int,
+        boundary_low: float = 1.0,
+        boundary_high: float = 2.5,
+        radius_neighbors: int = 2,
+        diversity_weight: float = 0.25
+    ):
+    """
+    Select prototypes immediately outside the writer's genuine region.
+
+    normalized_distance < boundary_low:
+        Too close or possibly inside the genuine region.
+
+    boundary_low <= normalized_distance <= boundary_high:
+        Desired hard-negative region.
+
+    normalized_distance > boundary_high:
+        Easy negative.
+    """
+
+    n_gen = len(f_gen)
+    n_select = min(n_select, len(prototypes))
+    radius_neighbors = min(radius_neighbors, n_gen - 1)
+
+    # Pairwise genuine distances
+    genuine_distances = cdist(f_gen, f_gen, metric="euclidean")
+    np.fill_diagonal(genuine_distances, np.inf)
+
+    # Local radius for each genuine feature
+    nearest_genuine_distances = np.sort(genuine_distances, axis=1)[:, :radius_neighbors]
+    local_radii = np.mean(nearest_genuine_distances, axis=1)
+    local_radii = np.maximum(local_radii, 1e-8)
+
+    # Distance from each prototype to every genuine feature
+    prototype_genuine_distances = cdist(prototypes, f_gen, metric="euclidean")
+
+    # Genuine feature nearest to each prototype
+    nearest_genuine_indices = np.argmin(prototype_genuine_distances, axis=1)
+    nearest_genuine_distances = prototype_genuine_distances[
+        np.arange(len(prototypes)),
+        nearest_genuine_indices
+    ]
+
+    # Normalize by the local genuine radius
+    normalized_distances = nearest_genuine_distances / local_radii[nearest_genuine_indices]
+
+    # Desired boundary band
+    candidate_indices = np.where(
+        (normalized_distances >= boundary_low) &
+        (normalized_distances <= boundary_high)
+    )[0]
+
+    # If there are not enough boundary candidates, add the nearest safe candidates
+    if len(candidate_indices) < n_select:
+        safe_indices = np.where(normalized_distances >= boundary_low)[0]
+        safe_order = safe_indices[
+            np.argsort(np.abs(normalized_distances[safe_indices] - boundary_low))
+        ]
+        candidate_indices = np.unique(
+            np.concatenate([candidate_indices, safe_order])
+        )
+
+    # Last fallback: use all prototypes ordered by boundary distance
+    if len(candidate_indices) < n_select:
+        candidate_indices = np.argsort(
+            np.abs(normalized_distances - boundary_low)
+        )
+
+    target_distance = (boundary_low + boundary_high) / 2
+    prototype_scale = np.median(cdist(prototypes, prototypes))
+
+    if prototype_scale <= 1e-8:
+        prototype_scale = 1.0
+
+    selected_indices = []
+    remaining_indices = candidate_indices.tolist()
+
+    while len(selected_indices) < n_select and remaining_indices:
+        if not selected_indices:
+            selected_idx = min(
+                remaining_indices,
+                key=lambda idx: abs(normalized_distances[idx] - target_distance)
+            )
+        else:
+            best_score = None
+            selected_idx = None
+
+            for idx in remaining_indices:
+                hardness_cost = abs(normalized_distances[idx] - target_distance)
+
+                min_diversity_distance = np.min(
+                    cdist(
+                        prototypes[idx:idx + 1],
+                        prototypes[selected_indices]
+                    )
+                )
+
+                normalized_diversity = min_diversity_distance / prototype_scale
+                score = hardness_cost - diversity_weight * normalized_diversity
+
+                if best_score is None or score < best_score:
+                    best_score = score
+                    selected_idx = idx
+
+        selected_indices.append(selected_idx)
+        remaining_indices.remove(selected_idx)
+
+    selected_indices = np.asarray(selected_indices, dtype=int)
+
+    diagnostics = {
+        "normalized_distances": normalized_distances,
+        "selected_normalized_distances": normalized_distances[selected_indices],
+        "n_boundary_candidates": int(np.sum(
+            (normalized_distances >= boundary_low) &
+            (normalized_distances <= boundary_high)
+        ))
+    }
+
+    return prototypes[selected_indices], selected_indices, diagnostics
 
 def generate_diss_training_data(
         data: np.ndarray,
@@ -34,7 +155,11 @@ def generate_diss_training_data(
         rng: np.random.RandomState,
         dist_type: str = "standard",
         n_gen: int = 12,
-        n_writer_centroids: int = 2
+        n_writer_centroids: int = 2,
+        boundary_low: float = 1.0,
+        boundary_high: float = 2.5,
+        radius_neighbors: int = 2,
+        diversity_weight: float = 0.25
     ) -> Tuple[np.ndarray, np.ndarray]:
 
     """
@@ -173,6 +298,31 @@ def generate_diss_training_data(
             print(
                 f"Writer {user_id}: {actual_n_centroids} centroids, "
                 f"{len(selected_prototypes)} selected prototypes"
+            )
+        elif dist_type == "boundary":
+            n_neg_s = min(n_neg_s, prototypes.shape[0])
+
+            selected_prototypes, selected_indices, diagnostics = select_boundary_prototypes(
+                f_gen=f_gen,
+                prototypes=prototypes,
+                n_select=n_neg_s,
+                boundary_low=boundary_low,
+                boundary_high=boundary_high,
+                radius_neighbors=radius_neighbors,
+                diversity_weight=diversity_weight
+            )
+
+            neg_diss, _, _ = _compute_dissimilarity(
+                f_gen[:n_pos_s],
+                selected_prototypes,
+                gen_idxs[:n_pos_s],
+                np.arange(len(selected_prototypes))
+            )
+
+            print(
+                f"Writer {user_id}: boundary candidates="
+                f"{diagnostics['n_boundary_candidates']}, selected={selected_indices.tolist()}, "
+                f"distances={np.round(diagnostics['selected_normalized_distances'], 3).tolist()}"
             )
 
         ddn = neg_diss.reshape(-1, feat_size)
@@ -457,16 +607,23 @@ def main_validation(args):
         data_scaled = scaler.fit_transform(X_train)
         prot_model = PrototypeModel(name=cluster_algo, n_clusters=k)
         prot_model.fit(data_scaled)
-        prototypes = prot_model.get_prototypes()
+        scaled_prototypes = prot_model.get_prototypes()
+        prototypes = scaler.inverse_transform(scaled_prototypes)
         
         # Create diss. training data
-        diss_data, diss_target =   generate_diss_training_data(X_train, 
-                                           y_train, 
-                                           prototypes,
-                                           rng, 
-                                           dist_type = dist_type, 
-                                           n_gen = num_gen_train
-                                           )
+        diss_data, diss_target = diss_data, diss_target = generate_diss_training_data(
+                    data,
+                    label,
+                    prototypes,
+                    rng,
+                    dist_type=dist_type,
+                    n_gen=num_gen_train,
+                    n_writer_centroids=args.n_writer_centroids,
+                    boundary_low=args.boundary_low,
+                    boundary_high=args.boundary_high,
+                    radius_neighbors=args.radius_neighbors,
+                    diversity_weight=args.diversity_weight
+                )
 
         # Create feat. validation data
         input_data = (
@@ -482,7 +639,7 @@ def main_validation(args):
                      n_data = 1,
                      n_ref= num_gen_ref,
                      n_query= num_gen_test,
-                     include_skilled_forgery=False,
+                     include_skilled_forgery=True,
                      return_indices=True
                     ))
  
@@ -496,11 +653,12 @@ def main_validation(args):
         test(model, diss_val_x, diss_val_y, diss_val_ds, output_path,filename=filename)
         
     #Compute EER metric          
-    evaluate(f_pred_path, 
-                     f_metric_path, 
-                     folders = [pred_folder],
-                     forgeries = ['random']
-                     )
+    evaluate(
+                    f_pred_path,
+                    f_metric_path,
+                    folders=[pred_folder],
+                    forgeries=["skilled", "random"]
+                )
     
     print("END VALIDATION")
 
@@ -554,9 +712,10 @@ def main_test(args):
             # Compute prototypes
             scaler = StandardScaler()
             data_scaled = scaler.fit_transform(data)
-                
             prot_model.fit(data_scaled)
-            prototypes = prot_model.get_prototypes()
+
+            scaled_prototypes = prot_model.get_prototypes()
+            prototypes = scaler.inverse_transform(scaled_prototypes)
 
     # Seed            
     rng = np.random.RandomState(args.seed)
@@ -564,27 +723,37 @@ def main_test(args):
         print(file_number)
         
         # Create diss. training data
-        diss_data, diss_target =  generate_diss_training_data(data, 
-                                                        label, 
-                                                        prototypes,
-                                                        rng, 
-                                                        dist_type = dist_type, 
-                                                        n_gen = num_gen_train
-                                                        )
+        diss_data, diss_target = generate_diss_training_data(
+                    data,
+                    label,
+                    prototypes,
+                    rng,
+                    dist_type=dist_type,
+                    n_gen=num_gen_train,
+                    n_writer_centroids=args.n_writer_centroids,
+                    boundary_low=args.boundary_low,
+                    boundary_high=args.boundary_high,
+                    radius_neighbors=args.radius_neighbors,
+                    diversity_weight=args.diversity_weight
+                )
         
         # Train classifier
         model = train(model_choice, diss_data,  diss_target)
         
         # Create diss. test data
-        diss_test_x, diss_test_y, *diss_test_ds  = next(generate_diss_test_data(
-                     exp_set, 
-                     rng,
-                     n_data = 1,
-                     n_ref= num_gen_ref,
-                     n_query= num_gen_test,
-                     include_skilled_forgery=True,
-                     return_indices=True
-                    ))
+        diss_test_x, diss_test_y, *diss_test_ds  = next(diss_data, diss_target = generate_diss_training_data(
+                    data,
+                    label,
+                    prototypes,
+                    rng,
+                    dist_type=dist_type,
+                    n_gen=num_gen_train,
+                    n_writer_centroids=args.n_writer_centroids,
+                    boundary_low=args.boundary_low,
+                    boundary_high=args.boundary_high,
+                    radius_neighbors=args.radius_neighbors,
+                    diversity_weight=args.diversity_weight
+                ))
         
         test_filename = f'{basename}_ts__n{file_number}_r{num_gen_ref}_q{num_gen_test}_sk1_iu{exp_users[0]}-{exp_users[-1]+1}.npz'
        
@@ -610,12 +779,11 @@ def parse_args(args_list=None):
     main_parser.add_argument('--cluster-algo', type=str, default='kmeans', choices=PROTOTYPE_MODELS)
     main_parser.add_argument('--n-clusters', type=int, default=10)
     main_parser.add_argument('--model-choice', type=str, default='sgd', choices=['svm','sgd'])
-    main_parser.add_argument('--dist-type', type=str, default='poscentroid', choices=['standard', 'poscentroid', 'multicentroid'])
+    main_parser.add_argument('--dist-type', type=str, default='poscentroid', choices=['standard', 'poscentroid', 'multicentroid', 'boundary'])
 
     main_parser.add_argument('--f-pred-path', type=str, required=True,  help='Absolute path to a folder where predictions will be saved.')
     main_parser.add_argument('--f-metric-path', type=str, required=True,  help='Absolute path to a folder where computed metrics will be saved.')
     main_parser.add_argument('--input-feat-path', type=str, required=True, help='Path to a npz file containing the fields: features, y (labels), and yforg (forgery flag).')
-    main_parser.add_argument("--n-writer-centroids",type=int,default=2)
 
     main_parser.add_argument('--exp-users', type=int, nargs=2, default=(0, 300))
     main_parser.add_argument('--dev-users', type=int, nargs=2, default=(300, 581))
@@ -629,9 +797,20 @@ def parse_args(args_list=None):
     
     main_parser.add_argument('--seed',  type=int,  default=42, help='Seed for reproducibility.')
     main_parser.add_argument('--n-folds', type=int, default=5, help = 'Determine the number of repetition.')
+
+    #Multicentroid
+    main_parser.add_argument("--n-writer-centroids",type=int,default=2)
+
+    #Boundary
+    main_parser.add_argument("--boundary-low", type=float, default=1.0)
+    main_parser.add_argument("--boundary-high", type=float, default=2.5)
+    main_parser.add_argument("--radius-neighbors", type=int, default=2)
+    main_parser.add_argument("--diversity-weight", type=float, default=0.25)
+    
     
     main_parser.set_defaults(func=main)
 
+    
     return main_parser.parse_args(args_list)
 
 
