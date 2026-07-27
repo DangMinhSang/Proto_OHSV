@@ -31,98 +31,110 @@ def select_boundary_prototypes(
         prototypes: np.ndarray,
         n_select: int,
         boundary_low: float = 1.0,
-        boundary_high: float = 2.5,
+        pool_factor: int = 2,
         radius_neighbors: int = 2,
-        diversity_weight: float = 0.25
+        diversity_weight: float = 0.0
     ):
-    """
-    Select prototypes immediately outside the writer's genuine region.
+    if len(f_gen) < 2:
+        raise ValueError("At least two genuine signatures are required")
 
-    normalized_distance < boundary_low:
-        Too close or possibly inside the genuine region.
+    if radius_neighbors < 1:
+        raise ValueError("radius_neighbors must be at least 1")
 
-    boundary_low <= normalized_distance <= boundary_high:
-        Desired hard-negative region.
+    if boundary_low < 0:
+        raise ValueError("boundary_low must be non-negative")
 
-    normalized_distance > boundary_high:
-        Easy negative.
-    """
+    if pool_factor < 1:
+        raise ValueError("pool_factor must be at least 1")
 
-    n_gen = len(f_gen)
     n_select = min(n_select, len(prototypes))
-    radius_neighbors = min(radius_neighbors, n_gen - 1)
+    radius_neighbors = min(radius_neighbors, len(f_gen) - 1)
 
-    # Pairwise genuine distances
+    # Local genuine radius
     genuine_distances = cdist(f_gen, f_gen, metric="euclidean")
     np.fill_diagonal(genuine_distances, np.inf)
 
-    # Local radius for each genuine feature
-    nearest_genuine_distances = np.sort(genuine_distances, axis=1)[:, :radius_neighbors]
+    nearest_genuine_distances = np.sort(
+        genuine_distances,
+        axis=1
+    )[:, :radius_neighbors]
+
     local_radii = np.mean(nearest_genuine_distances, axis=1)
     local_radii = np.maximum(local_radii, 1e-8)
 
-    # Distance from each prototype to every genuine feature
-    prototype_genuine_distances = cdist(prototypes, f_gen, metric="euclidean")
+    # Distance from prototypes to genuine samples
+    prototype_genuine_distances = cdist(
+        prototypes,
+        f_gen,
+        metric="euclidean"
+    )
 
-    # Genuine feature nearest to each prototype
-    nearest_genuine_indices = np.argmin(prototype_genuine_distances, axis=1)
+    nearest_genuine_indices = np.argmin(
+        prototype_genuine_distances,
+        axis=1
+    )
+
     nearest_genuine_distances = prototype_genuine_distances[
         np.arange(len(prototypes)),
         nearest_genuine_indices
     ]
 
-    # Normalize by the local genuine radius
-    normalized_distances = nearest_genuine_distances / local_radii[nearest_genuine_indices]
+    normalized_distances = (
+        nearest_genuine_distances /
+        local_radii[nearest_genuine_indices]
+    )
 
-    # Desired boundary band
-    candidate_indices = np.where(
-        (normalized_distances >= boundary_low) &
-        (normalized_distances <= boundary_high)
+    # Keep only prototypes outside the genuine boundary
+    safe_indices = np.where(
+        normalized_distances >= boundary_low
     )[0]
 
-    # If there are not enough boundary candidates, add the nearest safe candidates
-    if len(candidate_indices) < n_select:
-        safe_indices = np.where(normalized_distances >= boundary_low)[0]
-        safe_order = safe_indices[
-            np.argsort(np.abs(normalized_distances[safe_indices] - boundary_low))
-        ]
-        candidate_indices = np.unique(
-            np.concatenate([candidate_indices, safe_order])
+    if len(safe_indices) < n_select:
+        raise ValueError(
+            f"Only {len(safe_indices)} safe prototypes found, "
+            f"but {n_select} are required"
         )
 
-    # Last fallback: use all prototypes ordered by boundary distance
-    if len(candidate_indices) < n_select:
-        print(
-            f"Warning: only {len(candidate_indices)} safe prototypes "
-            f"available, but {n_select} are required."
-        )
+    # Sort safe prototypes from closest to farthest
+    safe_indices = safe_indices[
+        np.argsort(normalized_distances[safe_indices])
+    ]
 
-        candidate_indices = np.argsort(
-            np.abs(normalized_distances - boundary_low)
-        )
+    # Adaptive candidate pool
+    pool_size = min(
+        len(safe_indices),
+        n_select * pool_factor
+    )
 
-    target_distance = (boundary_low + boundary_high) / 2
-    prototype_scale = np.median(cdist(prototypes, prototypes))
+    candidate_indices = safe_indices[:pool_size]
 
-    if prototype_scale <= 1e-8:
-        prototype_scale = 1.0
+    # Prototype distance scale for diversity
+    prototype_pairwise = cdist(prototypes, prototypes)
+    nonzero_distances = prototype_pairwise[
+        prototype_pairwise > 0
+    ]
+
+    prototype_scale = (
+        np.median(nonzero_distances)
+        if len(nonzero_distances) > 0
+        else 1.0
+    )
 
     selected_indices = []
     remaining_indices = candidate_indices.tolist()
 
-    while len(selected_indices) < n_select and remaining_indices:
-        if not selected_indices:
-            selected_idx = min(
-                remaining_indices,
-                key=lambda idx: abs(normalized_distances[idx] - target_distance)
+    while len(selected_indices) < n_select:
+        best_idx = None
+        best_score = None
+
+        for idx in remaining_indices:
+            # Smaller distance means closer to genuine boundary
+            hardness_cost = (
+                normalized_distances[idx] -
+                normalized_distances[candidate_indices[0]]
             )
-        else:
-            best_score = None
-            selected_idx = None
 
-            for idx in remaining_indices:
-                hardness_cost = abs(normalized_distances[idx] - target_distance)
-
+            if selected_indices:
                 min_diversity_distance = np.min(
                     cdist(
                         prototypes[idx:idx + 1],
@@ -130,28 +142,44 @@ def select_boundary_prototypes(
                     )
                 )
 
-                normalized_diversity = min_diversity_distance / prototype_scale
-                score = hardness_cost - diversity_weight * normalized_diversity
+                diversity_score = (
+                    min_diversity_distance /
+                    prototype_scale
+                )
+            else:
+                diversity_score = 0.0
 
-                if best_score is None or score < best_score:
-                    best_score = score
-                    selected_idx = idx
+            score = (
+                hardness_cost -
+                diversity_weight * diversity_score
+            )
 
-        selected_indices.append(selected_idx)
-        remaining_indices.remove(selected_idx)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_idx = idx
 
-    selected_indices = np.asarray(selected_indices, dtype=int)
+        selected_indices.append(best_idx)
+        remaining_indices.remove(best_idx)
+
+    selected_indices = np.asarray(
+        selected_indices,
+        dtype=int
+    )
 
     diagnostics = {
         "normalized_distances": normalized_distances,
-        "selected_normalized_distances": normalized_distances[selected_indices],
-        "n_boundary_candidates": int(np.sum(
-            (normalized_distances >= boundary_low) &
-            (normalized_distances <= boundary_high)
-        ))
+        "selected_normalized_distances": (
+            normalized_distances[selected_indices]
+        ),
+        "n_safe_prototypes": len(safe_indices),
+        "pool_size": pool_size
     }
 
-    return prototypes[selected_indices], selected_indices, diagnostics
+    return (
+        prototypes[selected_indices],
+        selected_indices,
+        diagnostics
+    )
 
 def generate_diss_training_data(
         data: np.ndarray,
